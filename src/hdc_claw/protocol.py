@@ -332,10 +332,16 @@ class HdcSession:
         raw_bytes = self.run_shell_bytes(command, timeout=timeout, use_pty=use_pty)
         return raw_bytes.decode("utf-8", errors="replace")
 
-    def dump_ui_tree(self, prefix_cmd: str | None = None, settle_sec: float = 0.0) -> dict:
+    def dump_ui_tree(
+        self,
+        prefix_cmd: str | None = None,
+        settle_sec: float = 0.0,
+        keep_temp: bool = False,
+    ) -> dict:
         """
         Fast-path UI dump over CMD_UNITY_EXECUTE (1001).
         Optionally runs `prefix_cmd` and `sleep settle_sec` in a single on-device pipeline.
+        By default the device-side JSON is removed after `cat` (use keep_temp to retain it).
         """
         parts = []
         if prefix_cmd:
@@ -346,6 +352,8 @@ class HdcSession:
             "uitest dumpLayout -p /data/local/tmp/hdc_ui.json >/dev/null 2>&1 "
             "&& cat /data/local/tmp/hdc_ui.json"
         )
+        if not keep_temp:
+            parts.append("rm -f /data/local/tmp/hdc_ui.json")
         sh_cmd = "; ".join(parts)
         raw_bytes = self.run_shell_bytes(sh_cmd, timeout=15.0)
         idx = raw_bytes.find(b"{")

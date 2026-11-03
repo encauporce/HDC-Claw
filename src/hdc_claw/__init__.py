@@ -27,6 +27,7 @@ from .ui import (
     build_scroll_shell_cmd,
     build_swipe_shell_cmd,
     build_tap_shell_cmd,
+    cleanup_device_temp,
     compute_ui_diff,
     execute_action_with_feedback,
     find_matching_elements,
@@ -42,7 +43,7 @@ from .vision import (
     stitch_and_slice_frames,
 )
 
-__version__ = "1.0.0"
+__version__ = "3.3.0"
 __all__ = [
     "HdcSession",
     "DaemonClientSession",
@@ -64,6 +65,7 @@ __all__ = [
     "find_matching_elements",
     "compute_ui_diff",
     "execute_action_with_feedback",
+    "cleanup_device_temp",
     "resolve_element_from_cache_or_dump",
     "compress_image_bytes",
     "run_long_screen",

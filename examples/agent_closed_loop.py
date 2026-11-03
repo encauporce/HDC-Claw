@@ -24,12 +24,15 @@ def agent_search_and_read(sess, keyword: str):
     )
     print(f"[*] Located search box at {target_el['center']} (used_cache={used_cache})")
 
-    # 2. Perform closed-loop tap with instant post-action diff
+    # 2. Perform closed-loop tap with instant post-action diff + annotated proof image
     cx, cy = target_el["center"]
     tap_cmd = build_tap_shell_cmd(cx, cy, "click")
-    _, diff = execute_action_with_feedback(sess, tap_cmd, feedback_mode="diff", wait_after=0.35)
+    _, diff = execute_action_with_feedback(
+        sess, tap_cmd, feedback_mode="both", annotate=True, wait_after=0.35
+    )
 
     print(f"[*] Scene changed: {diff['scene_changed']}, newly added targets: {diff['added_count']}")
+    print(f"[*] Proof image: {diff.get('screenshot_path')} (annotated={diff.get('annotated')})")
 
     # 3. If reading a long page (e.g., search results or waterfall cards)
     print("[*] Capturing zero-inertia long screenshot with native slices...")

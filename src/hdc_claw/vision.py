@@ -20,7 +20,7 @@ try:
 except ImportError:
     Image = None
 
-from .ui import build_scroll_shell_cmd, invalidate_ui_cache
+from .ui import build_scroll_shell_cmd, cleanup_device_temp, invalidate_ui_cache
 
 
 def extract_jpeg_payload(raw_bytes: bytes) -> bytes:
@@ -242,6 +242,7 @@ def run_long_screen(
     settle_sec: float = 0.35,
     out_dir: Path | None = None,
     stem: str = "long_screen",
+    keep_device_temp: bool = False,
 ) -> dict:
     if Image is None:
         raise RuntimeError("Pillow (PIL) is required for long-screen stitching and slicing.")
@@ -250,7 +251,8 @@ def run_long_screen(
     for page_idx in range(max_pages):
         if page_idx == 0:
             sh_cmd = (
-                "snapshot_display -w 1400 -h 920 -f /data/local/tmp/hdc_long.jpeg >/dev/null 2>&1 "
+                "rm -f /data/local/tmp/hdc_long.jpeg; "
+                "snapshot_display -f /data/local/tmp/hdc_long.jpeg >/dev/null 2>&1 "
                 "&& cat /data/local/tmp/hdc_long.jpeg"
             )
         else:
@@ -265,7 +267,8 @@ def run_long_screen(
             sh_cmd = (
                 f"{scroll_cmd} >/dev/null 2>&1; "
                 f"sleep {settle_sec:.2f}; "
-                f"snapshot_display -w 1400 -h 920 -f /data/local/tmp/hdc_long.jpeg >/dev/null 2>&1 "
+                "rm -f /data/local/tmp/hdc_long.jpeg; "
+                "snapshot_display -f /data/local/tmp/hdc_long.jpeg >/dev/null 2>&1 "
                 "&& cat /data/local/tmp/hdc_long.jpeg"
             )
         raw_bytes = sess.run_shell_bytes(sh_cmd, timeout=15.0)
@@ -278,18 +281,22 @@ def run_long_screen(
                 break
         frames.append(im)
 
+    if not keep_device_temp:
+        cleanup_device_temp(sess)
     invalidate_ui_cache()
     if out_dir is None:
         out_dir = Path.cwd()
 
     stitch_info = stitch_and_slice_frames(frames, out_dir=out_dir, stem=stem, quality=quality)
+    frame_w, frame_h = frames[0].size
     return {
         "status": "long_screenshot_ready",
         "scroll_engine": scroll_engine,
         "keep_ms": keep_ms,
-        "native_resolution": [2800, 1840],
-        "capture_scale": 0.5,
-        "coord_multiplier": 2.0,
+        "native_resolution": [frame_w, frame_h],
+        "capture_scale": 1.0,
+        "coord_multiplier": 1.0,
+        "coordinate_note": "slice pixels are device-native; use dump-ui bounds for taps",
         "reading_guide": (
             "Each file in `slices` (slice_01.jpg, slice_02.jpg, ...) is a pure, un-stitched native "
             "viewport frame captured after a zero-inertia dead-stop scroll (-k 220ms). Read them "

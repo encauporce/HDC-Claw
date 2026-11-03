@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hdc-claw"
-version = "1.0.0"
+version = "3.3.0"
 description = "Pure-Python HarmonyOS NEXT / 6.0 HDC Wireless Protocol Client & AI Agent Automation Toolkit"
 readme = "README.md"
 requires-python = ">=3.9"

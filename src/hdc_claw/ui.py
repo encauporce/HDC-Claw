@@ -11,6 +11,7 @@ Features:
 from __future__ import annotations
 
 import base64
+import io
 import json
 import re
 import socket
@@ -18,6 +19,12 @@ import time
 from pathlib import Path
 from typing import Any
 
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:
+    Image = ImageDraw = ImageFont = None
+
+from .config import cleanup_device_temp_shell
 from .protocol import ANSI_ESCAPE_RE, HdcSession
 
 UI_CACHE_PATH = Path.home() / ".gemini" / "hdc_last_ui_cache.json"
@@ -483,6 +490,208 @@ def compute_ui_diff(
     }
 
 
+def _split_feedback_stream(raw: bytes) -> tuple[bytes, dict | None]:
+    """Split a combined `snapshot_display JPEG + dumpLayout JSON` stream."""
+    marker = b"__HDC_JSON__"
+    midx = raw.find(marker)
+    img_part = raw[:midx] if midx >= 0 else raw
+    jpeg = b""
+    soi = img_part.find(b"\xff\xd8")
+    if soi >= 0:
+        eoi = img_part.rfind(b"\xff\xd9")
+        jpeg = img_part[soi : eoi + 2] if eoi > soi else img_part[soi:]
+    rest = raw[midx + len(marker) :] if midx >= 0 else b""
+    jidx = rest.find(b"{")
+    tree = None
+    if jidx >= 0:
+        try:
+            tree = json.loads(rest[jidx:].decode("utf-8", errors="replace"))
+        except Exception:
+            tree = None
+    return jpeg, tree
+
+
+def capture_screenshot_bytes(
+    sess: Any,
+    action_cmd: str | None = None,
+    wait_after: float = 0.0,
+    keep_temp: bool = False,
+    temp_path: str = "/data/local/tmp/hdc_snap.jpeg",
+) -> bytes:
+    parts = []
+    if action_cmd:
+        parts.append(f"({action_cmd}) >/dev/null 2>&1")
+    if wait_after > 0:
+        parts.append(f"sleep {wait_after:.2f}")
+    parts.append(f"rm -f {temp_path}")
+    parts.append(f"snapshot_display -f {temp_path} >/dev/null 2>&1 && cat {temp_path}")
+    if not keep_temp:
+        parts.append(f"rm -f {temp_path}")
+    return sess.run_shell_bytes("; ".join(parts), timeout=20.0)
+
+
+def _capture_screen_and_tree(
+    sess: Any,
+    action_cmd: str | None = None,
+    wait_after: float = 0.35,
+    keep_temp: bool = False,
+) -> tuple[bytes, dict | None]:
+    """One on-device pipeline: action → settle → snapshot_display → dumpLayout."""
+    parts = []
+    if action_cmd:
+        parts.append(f"({action_cmd}) >/dev/null 2>&1")
+    if wait_after > 0:
+        parts.append(f"sleep {wait_after:.2f}")
+    parts.append("rm -f /data/local/tmp/hdc_snap.jpeg /data/local/tmp/hdc_ui.json")
+    parts.append("snapshot_display -f /data/local/tmp/hdc_snap.jpeg >/dev/null 2>&1")
+    parts.append("uitest dumpLayout -p /data/local/tmp/hdc_ui.json >/dev/null 2>&1")
+    parts.append(
+        "cat /data/local/tmp/hdc_snap.jpeg; "
+        "printf '\\n__HDC_JSON__\\n'; "
+        "cat /data/local/tmp/hdc_ui.json"
+    )
+    if not keep_temp:
+        parts.append("rm -f /data/local/tmp/hdc_snap.jpeg /data/local/tmp/hdc_ui.json")
+    raw = sess.run_shell_bytes("; ".join(parts), timeout=25.0)
+    return _split_feedback_stream(raw)
+
+
+def _image_size(raw_bytes: bytes) -> tuple[int, int]:
+    if Image is None:
+        return (0, 0)
+    from .vision import extract_jpeg_payload
+
+    try:
+        with Image.open(io.BytesIO(extract_jpeg_payload(raw_bytes))) as im:
+            return im.size
+    except Exception:
+        return (0, 0)
+
+
+def _save_feedback_image(data: bytes, name: str = "hdc_last_feedback.jpeg") -> Path:
+    path = Path.home() / ".gemini" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return path
+
+
+def _screenshot_meta(
+    path: Path,
+    comp_bytes: bytes,
+    img_w: int,
+    img_h: int,
+    raw_len: int,
+    native_wh: tuple[int, int] | None = None,
+    **extra,
+) -> dict:
+    native_w, native_h = native_wh or (img_w, img_h)
+    if not native_w or not native_h:
+        native_w, native_h = img_w, img_h
+    return {
+        "screenshot_path": str(path),
+        "image_resolution": [img_w, img_h],
+        "native_resolution": [native_w, native_h],
+        "coord_scale": round(native_w / img_w, 3) if img_w else 1.0,
+        "raw_bytes": raw_len,
+        "compressed_bytes": len(comp_bytes),
+        **extra,
+    }
+
+
+def _annotate_screenshot_bytes(
+    comp_bytes: bytes,
+    elements: list[dict],
+    native_wh: tuple[int, int] | None = None,
+) -> tuple[bytes, bool]:
+    """Draw compact-element boxes + IDs on a compressed screenshot."""
+    if Image is None or ImageDraw is None:
+        return comp_bytes, False
+    try:
+        im = Image.open(io.BytesIO(comp_bytes)).convert("RGB")
+    except Exception:
+        return comp_bytes, False
+    native_w, native_h = native_wh or (0, 0)
+    if not native_w or not native_h:
+        native_w, native_h = im.width, im.height
+    sx = im.width / native_w
+    sy = im.height / native_h
+    draw = ImageDraw.Draw(im)
+    try:
+        font = ImageFont.load_default(size=16)
+    except Exception:
+        try:
+            font = ImageFont.load_default()
+        except Exception:
+            font = None
+    for el in elements[:40]:
+        b = parse_bounds(el.get("bounds", ""))
+        if not b:
+            continue
+        x1 = max(0, min(im.width - 1, int(b["x1"] * sx)))
+        y1 = max(0, min(im.height - 1, int(b["y1"] * sy)))
+        x2 = max(0, min(im.width - 1, int(b["x2"] * sx)))
+        y2 = max(0, min(im.height - 1, int(b["y2"] * sy)))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        draw.rectangle([x1, y1, x2, y2], outline=(255, 40, 40), width=2)
+        label = f"#{el.get('id', '?')}"
+        try:
+            draw.text((x1 + 2, max(0, y1 - 16)), label, fill=(255, 40, 40), font=font)
+        except Exception:
+            pass
+    buf = io.BytesIO()
+    im.save(buf, format="JPEG", quality=72, optimize=True, progressive=True, subsampling=2)
+    return buf.getvalue(), True
+
+
+def _crop_screenshot_bytes(
+    raw_bytes: bytes,
+    bounds: dict,
+    pad: int = 24,
+    max_width: int = 900,
+) -> tuple[bytes, tuple[int, int], tuple[int, int]]:
+    if Image is None:
+        raise RuntimeError("Pillow (PIL) is required for -F crop.")
+    from .vision import extract_jpeg_payload
+
+    jpeg = extract_jpeg_payload(raw_bytes)
+    im = Image.open(io.BytesIO(jpeg)).convert("RGB")
+    x1 = max(0, int(bounds["x1"]) - pad)
+    y1 = max(0, int(bounds["y1"]) - pad)
+    x2 = min(im.width, int(bounds["x2"]) + pad)
+    y2 = min(im.height, int(bounds["y2"]) + pad)
+    if x2 <= x1 or y2 <= y1:
+        x1, y1, x2, y2 = 0, 0, im.width, im.height
+    crop = im.crop((x1, y1, x2, y2))
+    if crop.width > max_width:
+        new_h = max(1, int(round(crop.height * max_width / crop.width)))
+        crop = crop.resize((max_width, new_h), Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    crop.save(buf, format="JPEG", quality=72, optimize=True, progressive=True, subsampling=2)
+    return buf.getvalue(), crop.size, im.size
+
+
+def _meaningful_ui_score(elements: list[dict]) -> int:
+    """Count readable text elements outside the top status/nav and bottom tab bars."""
+    score = 0
+    for el in elements:
+        txt = (el.get("text") or el.get("label") or el.get("description") or "").strip()
+        if len(txt) < 2:
+            continue
+        b = parse_bounds(el.get("bounds", ""))
+        if b and (b["y1"] < 120 or b["y1"] > 1656):
+            continue
+        score += 1
+    return score
+
+
+def cleanup_device_temp(sess: Any, include_b64: bool = False):
+    try:
+        sess.run_shell(cleanup_device_temp_shell(include_b64), timeout=5.0)
+    except Exception:
+        pass
+
+
 def execute_action_with_feedback(
     sess: Any,
     action_shell_cmd: str,
@@ -491,7 +700,20 @@ def execute_action_with_feedback(
     before_scene: dict | None = None,
     before_elements: list[dict] | None = None,
     wait_change: bool = False,
+    annotate: bool = False,
+    crop_target: dict | None = None,
+    keep_device_temp: bool = False,
 ) -> tuple[str, dict | None]:
+    """
+    Executes `action_shell_cmd` on the tablet and captures closed-loop feedback.
+
+    UI modes (`diff`, `summary`, `full`, `both`, `auto`) combine the action + settle +
+    `uitest dumpLayout` into a single on-device pipeline. Image modes (`screen`, `both`,
+    `auto`, `crop`) additionally run `snapshot_display`; `annotate` draws element IDs on
+    the image and `crop` returns only the matched element's region.
+    """
+    from .vision import compress_image_bytes
+
     if not feedback_mode or feedback_mode == "none":
         invalidate_ui_cache()
         out = sess.run_shell(action_shell_cmd, timeout=10.0)
@@ -503,14 +725,19 @@ def execute_action_with_feedback(
             before_scene = cache.get("scene")
             before_elements = cache.get("elements")
 
+    target_bounds = parse_bounds(crop_target.get("bounds", "")) if crop_target else None
+
     if feedback_mode in ("diff", "summary", "full"):
-        tree = sess.dump_ui_tree(prefix_cmd=action_shell_cmd, settle_sec=wait_after)
+        tree = sess.dump_ui_tree(
+            prefix_cmd=action_shell_cmd, settle_sec=wait_after, keep_temp=keep_device_temp
+        )
         after_scene, after_elements = analyze_and_flatten_ui(tree, compact=True)
 
+        # Optional adaptive settle: if wait_change is set and screen hasn't changed yet, wait 0.45s more once
         if wait_change and before_elements:
             diff_check = compute_ui_diff(before_scene, before_elements, after_scene, after_elements)
             if not diff_check["scene_changed"]:
-                tree = sess.dump_ui_tree(prefix_cmd=None, settle_sec=0.45)
+                tree = sess.dump_ui_tree(prefix_cmd=None, settle_sec=0.45, keep_temp=keep_device_temp)
                 after_scene, after_elements = analyze_and_flatten_ui(tree, compact=True)
 
         save_ui_cache(sess.host, sess.port, tree, after_scene, after_elements)
@@ -524,7 +751,7 @@ def execute_action_with_feedback(
                 "after_element_count": len(after_elements),
                 "after_elements": after_elements[:50],
             }
-        else:
+        else:  # full
             fb = {
                 "mode": "full",
                 "after_scene": after_scene,
@@ -533,31 +760,160 @@ def execute_action_with_feedback(
             }
         return "", fb
 
-    if feedback_mode == "screen":
-        from .vision import compress_image_bytes
-        invalidate_ui_cache()
-        snap_path = Path.home() / ".gemini" / "hdc_last_feedback.jpeg"
-        sh_cmd = (
-            f"({action_shell_cmd}) >/dev/null 2>&1; "
-            f"sleep {wait_after:.2f}; "
-            f"snapshot_display -w 1400 -h 920 -f /data/local/tmp/hdc_snap.jpeg >/dev/null 2>&1 "
-            f"&& cat /data/local/tmp/hdc_snap.jpeg"
+    if feedback_mode == "both":
+        jpeg_bytes, tree = _capture_screen_and_tree(
+            sess, action_shell_cmd, wait_after, keep_device_temp
         )
-        raw_bytes = sess.run_shell_bytes(sh_cmd, timeout=15.0)
-        comp_bytes, img_w, img_h, raw_len = compress_image_bytes(
-            raw_bytes, quality=68, fmt="JPEG"
+        if tree is not None:
+            after_scene, after_elements = analyze_and_flatten_ui(tree, compact=True)
+            if wait_change and before_elements:
+                diff_check = compute_ui_diff(before_scene, before_elements, after_scene, after_elements)
+                if not diff_check["scene_changed"]:
+                    tree = sess.dump_ui_tree(
+                        prefix_cmd=None, settle_sec=0.45, keep_temp=keep_device_temp
+                    )
+                    after_scene, after_elements = analyze_and_flatten_ui(tree, compact=True)
+            save_ui_cache(sess.host, sess.port, tree, after_scene, after_elements)
+            fb = compute_ui_diff(before_scene, before_elements, after_scene, after_elements)
+            fb["mode"] = "both"
+        else:
+            after_scene, after_elements = {}, []
+            fb = {
+                "mode": "both",
+                "scene_changed": None,
+                "ui_error": "dumpLayout failed; screenshot captured only",
+                "after_scene": {},
+                "after_element_count": 0,
+            }
+        if jpeg_bytes:
+            native_wh = _image_size(jpeg_bytes)
+            comp_bytes, img_w, img_h, raw_len = compress_image_bytes(
+                jpeg_bytes, quality=68, max_width=1000, fmt="JPEG"
+            )
+            annotated = False
+            if annotate:
+                comp_bytes, annotated = _annotate_screenshot_bytes(
+                    comp_bytes, after_elements, native_wh
+                )
+            snap_path = _save_feedback_image(comp_bytes)
+            fb.update(
+                _screenshot_meta(
+                    snap_path, comp_bytes, img_w, img_h, raw_len, native_wh=native_wh
+                )
+            )
+            fb["annotated"] = annotated
+        else:
+            fb["screenshot_error"] = "snapshot_display returned no JPEG"
+        return "", fb
+
+    if feedback_mode == "auto":
+        tree = sess.dump_ui_tree(
+            prefix_cmd=action_shell_cmd, settle_sec=wait_after, keep_temp=keep_device_temp
         )
-        snap_path.parent.mkdir(parents=True, exist_ok=True)
-        snap_path.write_bytes(comp_bytes)
-        return "", {
-            "mode": "screen",
-            "screenshot_path": str(snap_path),
-            "image_resolution": [img_w, img_h],
-            "native_resolution": [2800, 1840],
-            "coord_scale": 2.0,
-            "raw_bytes": raw_len,
-            "compressed_bytes": len(comp_bytes),
+        after_scene, after_elements = analyze_and_flatten_ui(tree, compact=True)
+        save_ui_cache(sess.host, sess.port, tree, after_scene, after_elements)
+        score = _meaningful_ui_score(after_elements)
+        if score >= 3:
+            fb = compute_ui_diff(before_scene, before_elements, after_scene, after_elements)
+            fb["mode"] = "auto"
+            fb["visual"] = False
+            fb["meaningful_text_elements"] = score
+            return "", fb
+
+        # Canvas-only page: the action already ran, so just grab the screenshot.
+        raw_bytes = capture_screenshot_bytes(
+            sess, action_cmd=None, wait_after=0.0, keep_temp=keep_device_temp
+        )
+        fb = {
+            "mode": "auto",
+            "visual": True,
+            "meaningful_text_elements": score,
+            "after_scene": after_scene,
+            "after_element_count": len(after_elements),
         }
+        if raw_bytes:
+            native_wh = _image_size(raw_bytes)
+            comp_bytes, img_w, img_h, raw_len = compress_image_bytes(
+                raw_bytes, quality=68, max_width=1000, fmt="JPEG"
+            )
+            annotated = False
+            if annotate:
+                comp_bytes, annotated = _annotate_screenshot_bytes(
+                    comp_bytes, after_elements, native_wh
+                )
+            snap_path = _save_feedback_image(comp_bytes)
+            fb.update(
+                _screenshot_meta(
+                    snap_path, comp_bytes, img_w, img_h, raw_len, native_wh=native_wh
+                )
+            )
+            fb["annotated"] = annotated
+        else:
+            fb["screenshot_error"] = "snapshot_display returned no JPEG"
+        return "", fb
+
+    if feedback_mode == "crop":
+        if target_bounds is None:
+            raise ValueError(
+                "-F crop requires a matched element target; use tap/input-text with --text/--key"
+            )
+        raw_bytes = capture_screenshot_bytes(
+            sess, action_shell_cmd, wait_after, keep_device_temp
+        )
+        if not raw_bytes:
+            raise RuntimeError("snapshot_display returned no JPEG for -F crop")
+        crop_bytes, crop_size, source_size = _crop_screenshot_bytes(raw_bytes, target_bounds)
+        crop_path = _save_feedback_image(crop_bytes, "hdc_last_feedback_crop.jpeg")
+        return "", {
+            "mode": "crop",
+            "screenshot_path": str(crop_path),
+            "crop_resolution": list(crop_size),
+            "source_resolution": list(source_size),
+            "crop_bounds": target_bounds,
+            "compressed_bytes": len(crop_bytes),
+            "matched_element": crop_target,
+        }
+
+    if feedback_mode == "screen":
+        invalidate_ui_cache()
+        after_scene: dict = {}
+        after_elements: list[dict] = []
+        if annotate:
+            jpeg_bytes, tree = _capture_screen_and_tree(
+                sess, action_shell_cmd, wait_after, keep_device_temp
+            )
+            if tree is not None:
+                after_scene, after_elements = analyze_and_flatten_ui(tree, compact=True)
+                save_ui_cache(sess.host, sess.port, tree, after_scene, after_elements)
+        else:
+            jpeg_bytes = capture_screenshot_bytes(
+                sess, action_shell_cmd, wait_after, keep_device_temp
+            )
+        fb = {
+            "mode": "screen",
+            "after_scene": after_scene,
+            "after_element_count": len(after_elements),
+        }
+        if jpeg_bytes:
+            native_wh = _image_size(jpeg_bytes)
+            comp_bytes, img_w, img_h, raw_len = compress_image_bytes(
+                jpeg_bytes, quality=68, max_width=1000, fmt="JPEG"
+            )
+            annotated = False
+            if annotate:
+                comp_bytes, annotated = _annotate_screenshot_bytes(
+                    comp_bytes, after_elements, native_wh
+                )
+            snap_path = _save_feedback_image(comp_bytes)
+            fb.update(
+                _screenshot_meta(
+                    snap_path, comp_bytes, img_w, img_h, raw_len, native_wh=native_wh
+                )
+            )
+            fb["annotated"] = annotated
+        else:
+            fb["screenshot_error"] = "snapshot_display returned no JPEG"
+        return "", fb
 
     raise ValueError(f"Unsupported feedback mode: {feedback_mode}")
 

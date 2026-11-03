@@ -9,6 +9,14 @@
 
 Zero external binaries. Zero DevEco Studio / SDK requirements. Native RSA-3072 handshake, persistent keep-alive daemon (<15ms latency), kernel-level `/bin/uinput` touch/key fast-path, closed-loop UI diff feedback, and Taobao-resilient zero-inertia visual long-screenshots.
 
+### 🆕 What's new in v3.3
+
+- **Richer closed-loop feedback**: `-F both` (UI diff + screenshot in one on-device pipeline), `-F auto` (UI when the tree is readable, screenshot on canvas-only pages), `-F crop` (matched element crop), and `--annotate` (element boxes + IDs drawn on the image).
+- **Device temp hygiene**: temp images/UI dumps under `/data/local/tmp` are deleted after capture; `--keep-device-temp` retains them and `clean-temp` sweeps leftovers.
+- **Live daemon console**: a `TIME | ID | DUR | GAP | CMD` timing table with `SLOW`/`ERR` markers and optional per-op detail, mirrored to `~/.gemini/hdc_daemon.log`.
+- **Zero-config outputs**: `--output` is optional; JSON/screenshot/manifest default to `~/.gemini/` and `config --output-dir` changes the default directory once.
+- **Correct power modes**: `keep-awake` uses `power-shell wakeup` + `timeout -o` (not performance mode 602); `performance` is opt-in and `normal` restores both mode 600 and the default timeout.
+
 [中文文档](#中文文档) | [English Documentation](#english-documentation)
 
 ---
@@ -30,7 +38,7 @@ Zero external binaries. Zero DevEco Studio / SDK requirements. Native RSA-3072 h
   - **Dead-Stop Scroll**: Uses `uinput -T -m x1 y1 x2 y2 -k 220 450` (holding touch stationary for 220ms before lift-off), completely killing inertial fling in ArkUI `Scroll` and `WaterFlow` lists.
   - **Multi-Patch 2D Consensus**: 6 independent sub-patches across left and right waterfall columns compute median scroll distance, immune to live video cards and animated GIF badges.
   - **Native Viewport Slices**: Saves un-stitched native viewport frames (`_slice_01.jpg`, `_slice_02.jpg`) for 100% seam-free, artifact-free AI reading.
-- **Universal Progressive JPEG Compression**: Hardware downscaling (`1400x920`, 0.5x scale) + 4:2:0 progressive JPEG (`quality=68`), shrinking screenshots to **50KB–80KB** with 100% universal compatibility across all AI vision models and agent tools.
+- **Universal Progressive JPEG Compression**: Native-resolution capture + 4:2:0 progressive JPEG (`quality=68`, 1000px wide by default), shrinking screenshots to **50KB–100KB** with 100% universal compatibility across all AI vision models and agent tools.
 
 ---
 
@@ -65,8 +73,8 @@ Requires **Python 3.9+**, `cryptography`, and `Pillow`.
 # 1. Connect to tablet (auto-scans ports 30000-49999 if needed)
 hdc-claw --host 192.168.1.115 --port 35429 connect
 
-# 2. Keep screen awake
-hdc-claw screen --mode keep-awake
+# 2. Wake plus extend the screen-off timeout (NOT performance mode)
+hdc-claw screen --mode keep-awake --timeout-ms 7200000
 
 # 3. Launch app and get initial UI summary in ONE command
 hdc-claw launch --app "淘宝" -F summary
@@ -77,11 +85,28 @@ hdc-claw tap --text "我的淘宝" -F diff
 # 5. One-shot text input with auto-focus and Enter submission
 hdc-claw input-text --target-text "搜索" --text "华为平板" --submit -F diff
 
-# 6. High-compression snapshot (50-80KB progressive JPEG)
-hdc-claw screen --mode snapshot --output screen.jpg
+# 6. UI diff + annotated screenshot from the same on-device pipeline
+hdc-claw tap --text "我的订单" -F both --annotate
 
-# 7. Long page capture with zero-inertia dead-stop scrolling
-hdc-claw long-screen --pages 4 --keep-ms 220 --output manifest.json
+# 7. Auto feedback: UI on readable pages, screenshot on canvas-only pages
+hdc-claw tap --text "立即购买" -F auto
+
+# 8. Crop only the matched element (tap/input-text only)
+hdc-claw tap --text "筛选" -F crop
+
+# 9. High-compression snapshot (50-80KB progressive JPEG)
+hdc-claw screen --mode snapshot
+
+# 10. Long page capture with zero-inertia dead-stop scrolling
+hdc-claw long-screen --pages 4 --keep-ms 220
+
+# Outputs are optional: JSON -> ~/.gemini/hdc_last_output.json,
+# snapshot -> hdc_last_screen.jpg, long-screen -> hdc_last_long.json.
+# Change the default directory once:
+hdc-claw config --output-dir D:\hdc_runs
+
+# Sweep leftover device temp files
+hdc-claw clean-temp
 ```
 
 ---
@@ -103,6 +128,16 @@ out, diff = execute_action_with_feedback(sess, tap_cmd, feedback_mode="diff", wa
 
 print("Scene changed:", diff["scene_changed"])
 print("Newly added elements:", diff["added_elements"])
+
+# v3.3: UI diff + annotated screenshot from one on-device pipeline
+_, fb = execute_action_with_feedback(
+    sess, tap_cmd, feedback_mode="both", annotate=True, wait_after=0.35
+)
+print(fb["mode"], fb["screenshot_path"], fb["coord_scale"], fb["annotated"])
+
+# Or let the toolkit choose: UI on readable pages, screenshot on canvas-only pages
+_, auto = execute_action_with_feedback(sess, tap_cmd, feedback_mode="auto")
+print("visual fallback:", auto.get("visual"))
 
 sess.close()
 ```
@@ -127,7 +162,17 @@ sess.close()
   - **零惯性急停触控**：调用 `/bin/uinput -T -m x1 y1 x2 y2 -k 220 450`，在拖动结束后保持悬停按压 220ms 再松手，彻底吸收 ArkUI `Scroll` / `WaterFlow` 动能，解决传统长截屏在淘宝等瀑布流应用中的滑动漂移 Bug。
   - **左右双列 6 区域共识测距**：左右两列商品流各采样 3 个独立 Patch 计算位移中位数，即使某张商品卡片正在播放视频或有动态浮标，依然能 100% 精准判定滚动触底与视口衔接。
   - **原生视口切片直出（Native Viewport Slices）**：直接输出无拼接拼缝的原生视口切片（`_slice_01.jpg`、`_slice_02.jpg`），避免大模型因切片撕裂卡片和文字而产生幻觉。
-- **通用渐进式高压缩 JPEG**：硬件渲染层降采样（`1400x920`，0.5x 视口）+ Progressive JPEG（`subsampling=2, quality=68`），截图仅 **50KB–80KB**，在所有大模型、Agent 文件解析器与工具链中拥有 **100% 原生兼容性**。
+- **通用渐进式高压缩 JPEG**：原生分辨率采集 + Progressive JPEG（`subsampling=2, quality=68`，默认 1000px 宽），截图仅 **50KB–100KB**，在所有大模型、Agent 文件解析器与工具链中拥有 **100% 原生兼容性**。
+
+---
+
+### 🆕 v3.3 更新
+
+- **闭环反馈扩展**：`-F both`（UI diff + 截图，一条设备端管道）、`-F auto`（有可读文本回 UI，画布页回截图）、`-F crop`（只裁匹配元素）、`--annotate`（截图上画元素框和 ID）。
+- **设备临时文件清理**：`/data/local/tmp` 下的临时图和 UI dump 默认在采集后删除；`--keep-device-temp` 保留，`clean-temp` 扫尾。
+- **daemon 实时控制台**：`TIME | ID | DUR | GAP | CMD` 计时表，`SLOW`/`ERR` 标记，`--verbose` 显示每步操作细节，日志镜像到 `~/.gemini/hdc_daemon.log`。
+- **输出零配置**：所有 `--output` 可选，默认 `~/.gemini/hdc_last_output.json` / `hdc_last_screen.jpg` / `hdc_last_long.json`；`config --output-dir` 一次改默认目录。
+- **电源模式修正**：`keep-awake` = `power-shell wakeup` + `timeout -o`，不再误开 602 性能模式；`performance` 改为显式开启，`normal` 恢复 600 + 默认超时。
 
 ---
 

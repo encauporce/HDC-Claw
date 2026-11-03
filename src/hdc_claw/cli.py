@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
 import re
 import sys
 import threading
@@ -14,6 +15,18 @@ import time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from . import config
+from .config import (
+    CONFIG_PATH,
+    DEVICE_TMP_FILES,
+    DEFAULT_LONG_NAME,
+    DEFAULT_SCREENSHOT_NAME,
+    cleanup_device_temp_shell,
+    hdc_output_dir,
+    load_hdc_config,
+    resolve_output_path,
+    write_json_output,
+)
 from .daemon import (
     DAEMON_HOST,
     DAEMON_PORT,
@@ -35,6 +48,8 @@ from .ui import (
     build_key_shell_cmd,
     build_swipe_shell_cmd,
     build_tap_shell_cmd,
+    capture_screenshot_bytes,
+    cleanup_device_temp,
     compute_ui_diff,
     execute_action_with_feedback,
     find_matching_elements,
@@ -50,37 +65,42 @@ from .vision import (
 )
 
 
-def write_json_output(path: str | None, payload: dict):
-    if not path:
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
-        return
-    out_path = Path(path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"Success! Output written to: {out_path}")
-
-
 def cmd_daemon(args):
     saved = load_saved_target()
     target_host = args.host or saved.get("host", "192.168.1.115")
     target_port = args.port or saved.get("port", 35429)
 
     if args.action == "serve":
-        srv = LocalHdcDaemonServer(target_host, target_port)
+        verbose = bool(getattr(args, "verbose", False)) or os.environ.get(
+            "HDC_DAEMON_VERBOSE", ""
+        ) == "1"
+        srv = LocalHdcDaemonServer(target_host, target_port, verbose=verbose)
         srv.serve_forever()
         return
 
     if args.action == "status":
         client = try_connect_daemon(target_host, target_port, timeout=0.3)
         if client is None:
-            res = {"running": False, "daemon_addr": f"{DAEMON_HOST}:{DAEMON_PORT}"}
+            res = {
+                "running": False,
+                "daemon_addr": f"{DAEMON_HOST}:{DAEMON_PORT}",
+                "log_path": str(config.DAEMON_LOG_PATH),
+            }
         else:
             try:
                 info = client._call({"op": "ping"})
-                res = {"running": True, "daemon_addr": f"{DAEMON_HOST}:{DAEMON_PORT}", **info}
+                res = {
+                    "running": True,
+                    "daemon_addr": f"{DAEMON_HOST}:{DAEMON_PORT}",
+                    "log_path": str(config.DAEMON_LOG_PATH),
+                    **info,
+                }
             finally:
                 client.close()
-        write_json_output(args.output, res)
+        if args.output:
+            write_json_output(args.output, res)
+        else:
+            print(json.dumps(res, ensure_ascii=False, indent=2))
         return
 
     if args.action == "stop":
@@ -93,13 +113,18 @@ def cmd_daemon(args):
             finally:
                 client.close()
         res = {"status": "stopped"}
-        write_json_output(args.output, res)
+        if args.output:
+            write_json_output(args.output, res)
+        else:
+            print(json.dumps(res, ensure_ascii=False, indent=2))
         return
 
     if args.action == "start":
         client = try_connect_daemon(target_host, target_port, timeout=0.2)
         if client is None:
-            spawn_background_daemon(target_host, target_port)
+            spawn_background_daemon(
+                target_host, target_port, verbose=bool(getattr(args, "verbose", False))
+            )
             for _ in range(25):
                 time.sleep(0.06)
                 client = try_connect_daemon(target_host, target_port, timeout=0.1)
@@ -112,7 +137,51 @@ def cmd_daemon(args):
         finally:
             client.close()
         res = {"status": "started", "daemon_addr": f"{DAEMON_HOST}:{DAEMON_PORT}", **info}
-        write_json_output(args.output, res)
+        if args.output:
+            write_json_output(args.output, res)
+        else:
+            print(json.dumps(res, ensure_ascii=False, indent=2))
+
+
+def cmd_config(args):
+    cfg = load_hdc_config()
+    changed = False
+    if args.output_dir:
+        path = Path(args.output_dir).expanduser().resolve()
+        path.mkdir(parents=True, exist_ok=True)
+        cfg["output_dir"] = str(path)
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        changed = True
+    write_json_output(
+        getattr(args, "output", None),
+        {
+            "changed": changed,
+            "config_path": str(CONFIG_PATH),
+            "output_dir": str(hdc_output_dir()),
+            "config": cfg,
+        },
+    )
+
+
+def cmd_clean_temp(args):
+    sess = resolve_session(
+        args.host, args.port, force_scan=args.scan, use_daemon=not args.no_daemon
+    )
+    include_b64 = not args.keep_b64
+    try:
+        raw = sess.run_shell(cleanup_device_temp_shell(include_b64=include_b64), timeout=8.0)
+    finally:
+        sess.close()
+    write_json_output(
+        args.output,
+        {
+            "status": "cleaned",
+            "paths": DEVICE_TMP_FILES,
+            "included_b64": include_b64,
+            "output": ANSI_ESCAPE_RE.sub("", raw).strip(),
+        },
+    )
 
 
 def cmd_connect(args):
@@ -183,9 +252,9 @@ def cmd_dump_ui(args):
                 tree = cache["tree"]
                 used_cache = True
             else:
-                tree = sess.dump_ui_tree()
+                tree = sess.dump_ui_tree(keep_temp=args.keep_device_temp)
         else:
-            tree = sess.dump_ui_tree()
+            tree = sess.dump_ui_tree(keep_temp=args.keep_device_temp)
     finally:
         sess.close()
 
@@ -255,6 +324,9 @@ def cmd_tap(args):
             before_scene=before_scene,
             before_elements=before_elements,
             wait_change=args.wait_change,
+            annotate=getattr(args, "annotate", False),
+            crop_target=target_el,
+            keep_device_temp=getattr(args, "keep_device_temp", False),
         )
     finally:
         sess.close()
@@ -325,6 +397,9 @@ def cmd_input_text(args):
             before_scene=before_scene,
             before_elements=before_elements,
             wait_change=args.wait_change,
+            annotate=getattr(args, "annotate", False),
+            crop_target=target_el,
+            keep_device_temp=getattr(args, "keep_device_temp", False),
         )
     finally:
         sess.close()
@@ -469,6 +544,8 @@ def cmd_batch(args):
                 wait_after=args.wait_after,
                 before_scene=last_scene,
                 before_elements=last_elements,
+                annotate=getattr(args, "annotate", False),
+                keep_device_temp=getattr(args, "keep_device_temp", False),
             )
     finally:
         sess.close()
@@ -537,6 +614,8 @@ def cmd_launch(args):
             sh_cmd,
             feedback_mode=args.feedback,
             wait_after=args.wait_after,
+            annotate=getattr(args, "annotate", False),
+            keep_device_temp=getattr(args, "keep_device_temp", False),
         )
     finally:
         sess.close()
@@ -610,27 +689,53 @@ def cmd_screen(args):
     )
     try:
         if args.mode == "keep-awake":
-            raw = sess.run_shell("power-shell wakeup; power-shell setmode 602", timeout=5.0)
+            timeout_ms = getattr(args, "timeout_ms", 1800000)
+            raw = sess.run_shell(
+                f"power-shell wakeup; power-shell timeout -o {timeout_ms}", timeout=5.0
+            )
             write_json_output(
-                args.output, {"mode": "keep-awake", "output": ANSI_ESCAPE_RE.sub("", raw)}
+                args.output,
+                {
+                    "mode": "keep-awake",
+                    "timeout_ms": timeout_ms,
+                    "note": "screen timeout extended; performance mode is NOT enabled",
+                    "output": ANSI_ESCAPE_RE.sub("", raw),
+                },
+            )
+        elif args.mode == "performance":
+            raw = sess.run_shell("power-shell setmode 602", timeout=5.0)
+            write_json_output(
+                args.output,
+                {
+                    "mode": "performance",
+                    "power_mode": 602,
+                    "note": "performance mode enabled; run screen --mode normal to restore mode 600",
+                    "output": ANSI_ESCAPE_RE.sub("", raw),
+                },
             )
         elif args.mode == "normal":
-            raw = sess.run_shell("power-shell setmode 600", timeout=5.0)
+            raw = sess.run_shell("power-shell setmode 600; power-shell timeout -r", timeout=5.0)
             write_json_output(
-                args.output, {"mode": "normal", "output": ANSI_ESCAPE_RE.sub("", raw)}
+                args.output,
+                {
+                    "mode": "normal",
+                    "power_mode": 600,
+                    "note": "normal power mode and default screen timeout restored",
+                    "output": ANSI_ESCAPE_RE.sub("", raw),
+                },
             )
         elif args.mode == "snapshot":
-            size_flags = "" if getattr(args, "full_res", False) else "-w 1400 -h 920 "
-            sh_cmd = (
-                f"snapshot_display {size_flags}-f /data/local/tmp/snap_1.jpeg >/dev/null 2>&1 "
-                f"&& cat /data/local/tmp/snap_1.jpeg"
+            full_res = getattr(args, "full_res", False)
+            raw_bytes = capture_screenshot_bytes(
+                sess,
+                temp_path="/data/local/tmp/snap_1.jpeg",
+                keep_temp=getattr(args, "keep_device_temp", False),
             )
-            raw_bytes = sess.run_shell_bytes(sh_cmd, timeout=15.0)
-            out_path = Path(args.output)
+            out_path = resolve_output_path(args.output, DEFAULT_SCREENSHOT_NAME)
             fmt = "WEBP" if out_path.suffix.lower() == ".webp" else "JPEG"
             quality = getattr(args, "quality", 68)
             comp_bytes, img_w, img_h, raw_len = compress_image_bytes(
-                raw_bytes, quality=quality, fmt=fmt
+                raw_bytes, quality=quality, max_width=None if full_res else 1000, fmt=fmt
             )
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_bytes(comp_bytes)
@@ -646,7 +751,9 @@ def cmd_screen(args):
 
 
 def _run_long_screen_cli(sess, args, t0: float):
-    out_path = Path(args.output).resolve()
+    out_path = resolve_output_path(
+        getattr(args, "output", None), DEFAULT_LONG_NAME
+    ).resolve()
     if out_path.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
         out_dir = out_path.parent
         stem = out_path.stem
@@ -669,6 +776,7 @@ def _run_long_screen_cli(sess, args, t0: float):
         settle_sec=getattr(args, "settle", 0.35),
         out_dir=out_dir,
         stem=stem,
+        keep_device_temp=getattr(args, "keep_device_temp", False),
     )
     elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
     res["elapsed_ms"] = elapsed_ms
@@ -715,6 +823,8 @@ def cmd_ui(args):
             sh_cmd,
             feedback_mode=args.feedback,
             wait_after=args.wait_after,
+            annotate=getattr(args, "annotate", False),
+            keep_device_temp=getattr(args, "keep_device_temp", False),
         )
     finally:
         sess.close()
@@ -841,9 +951,12 @@ def _add_feedback_args(parser: argparse.ArgumentParser, default_wait: float = 0.
     parser.add_argument(
         "-F",
         "--feedback",
-        choices=["none", "diff", "summary", "full", "screen"],
+        choices=["none", "diff", "summary", "full", "screen", "both", "auto", "crop"],
         default="none",
-        help="Closed-loop auto-feedback in a single on-device pipeline (diff, summary, full, screen)",
+        help=(
+            "Closed-loop feedback: diff/summary/full (UI), screen (image), both (UI+image), "
+            "auto (UI unless canvas-empty, then image), crop (matched element image)"
+        ),
     )
     parser.add_argument(
         "-W",
@@ -857,13 +970,27 @@ def _add_feedback_args(parser: argparse.ArgumentParser, default_wait: float = 0.
         action="store_true",
         help="If UI hasn't changed after --wait-after, wait an extra 0.45s and re-check once",
     )
+    parser.add_argument(
+        "--annotate",
+        action="store_true",
+        help="Draw element boxes/IDs on screen/both/auto feedback images",
+    )
+    parser.add_argument(
+        "--keep-device-temp",
+        action="store_true",
+        help="Keep /data/local/tmp temp images/UI dumps instead of deleting them after capture",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="hdc-claw",
-        description="HDC-Claw: Pure-Python HarmonyOS NEXT / 6.0 HDC Wireless Client & AI Agent Automation Toolkit.",
+        description=(
+            "HDC-Claw: Pure-Python HarmonyOS NEXT / 6.0 HDC Wireless Client & "
+            "AI Agent Automation Toolkit (v3.3)."
+        ),
     )
+    p.add_argument("--version", action="version", version="hdc-claw 3.3.0")
     p.add_argument("--host", help="Tablet IP address (defaults to last connected host)")
     p.add_argument("--port", type=int, help="HDC wireless debugging port")
     p.add_argument(
@@ -884,8 +1011,25 @@ def build_parser() -> argparse.ArgumentParser:
         default="status",
         help="Daemon action (default: status)",
     )
+    p_dm.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print per-op detail lines under each command in the daemon console log",
+    )
     p_dm.add_argument("--output", help="Optional output JSON file path")
     p_dm.set_defaults(func=cmd_daemon)
+
+    # config
+    p_cfg = sub.add_parser(
+        "config",
+        help="Show or set persistent defaults (default output directory for auto-named files)",
+    )
+    p_cfg.add_argument(
+        "--output-dir",
+        help="Directory used when --output is omitted (e.g. D:\\hdc_runs)",
+    )
+    p_cfg.add_argument("--output", help="Optional JSON output path")
+    p_cfg.set_defaults(func=cmd_config)
 
     # connect
     p_conn = sub.add_parser(
@@ -909,6 +1053,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_dump.add_argument("--include-statusbar", action="store_true", help="Include top status bar nodes (y <= 97)")
     p_dump.add_argument("--use-cache", action="store_true", help="Reuse cached UI tree if within --cache-ttl")
     p_dump.add_argument("--cache-ttl", type=float, default=2.0, help="Max age in seconds for --use-cache (default 2.0)")
+    p_dump.add_argument(
+        "--keep-device-temp",
+        action="store_true",
+        help="Keep /data/local/tmp/hdc_ui.json instead of deleting it after the dump",
+    )
     p_dump.add_argument("--output", help="Optional output JSON file path")
     p_dump.set_defaults(func=cmd_dump_ui)
 
@@ -1008,12 +1157,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_scr.add_argument(
         "--mode",
-        choices=["keep-awake", "normal", "snapshot", "long-snapshot"],
+        choices=["keep-awake", "performance", "normal", "snapshot", "long-snapshot"],
         required=True,
-        help="keep-awake (mode 602), normal (mode 600), snapshot (compressed JPEG), or long-snapshot (zero-inertia scroll + native viewport slices)",
+        help=(
+            "keep-awake (wake + extend screen timeout), performance (power mode 602, opt-in), "
+            "normal (restore mode 600 + default timeout), snapshot (compressed JPEG), or "
+            "long-snapshot (zero-inertia scroll + native viewport slices)"
+        ),
+    )
+    p_scr.add_argument(
+        "--timeout-ms",
+        type=int,
+        default=1800000,
+        help="Screen-off timeout in ms for --mode keep-awake (default 1800000 = 30 min)",
     )
     p_scr.add_argument("--quality", type=int, default=68, help="JPEG compression quality (default 68)")
-    p_scr.add_argument("--full-res", action="store_true", help="Capture full 2800x1840 resolution instead of AI-optimized 1400x920")
+    p_scr.add_argument(
+        "--full-res",
+        action="store_true",
+        help="Compress at device-native width instead of the AI-optimized 1000px JPEG",
+    )
     p_scr.add_argument("--pages", type=int, default=4, help="Max pages to scroll for long-snapshot (default 4)")
     p_scr.add_argument("--scroll-x", type=int, default=1400, help="X coordinate for vertical scroll (default 1400)")
     p_scr.add_argument("--start-y", type=int, default=1420, help="Scroll start Y coordinate (default 1420)")
@@ -1027,7 +1190,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Scroll engine: touch-hold (uinput -T -m -k dead-stop) or wheel (uinput -M -s mouse wheel)",
     )
     p_scr.add_argument("--settle", type=float, default=0.35, help="Settle wait in seconds after each scroll (default 0.35)")
-    p_scr.add_argument("--output", required=True, help="Output JSON or image file path")
+    p_scr.add_argument(
+        "--keep-device-temp",
+        action="store_true",
+        help="Keep /data/local/tmp snapshots instead of deleting them after capture",
+    )
+    p_scr.add_argument("--output", help="Optional output JSON or image path (auto-named when omitted)")
     p_scr.set_defaults(func=cmd_screen)
 
     # long-screen (dedicated alias for scrolling long screenshot + slice generation)
@@ -1049,8 +1217,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Scroll engine: touch-hold (uinput -T -m -k dead-stop) or wheel (uinput -M -s mouse wheel)",
     )
     p_long.add_argument("--settle", type=float, default=0.35, help="Settle wait in seconds after each scroll (default 0.35)")
-    p_long.add_argument("--output", required=True, help="Output manifest JSON path (slices saved alongside)")
+    p_long.add_argument(
+        "--keep-device-temp",
+        action="store_true",
+        help="Keep /data/local/tmp/hdc_long.jpeg instead of deleting it after capture",
+    )
+    p_long.add_argument(
+        "--output",
+        help="Optional output manifest path (slices saved alongside; auto-named when omitted)",
+    )
     p_long.set_defaults(func=cmd_long_screen)
+
+    # clean-temp
+    p_clean = sub.add_parser(
+        "clean-temp",
+        help="Delete leftover HDC temp images/UI dumps (and optionally .b64 push fragments) on the device",
+    )
+    p_clean.add_argument(
+        "--keep-b64",
+        action="store_true",
+        help="Do not delete /data/local/tmp/*.b64 push fragments",
+    )
+    p_clean.add_argument("--output", help="Optional output JSON file path")
+    p_clean.set_defaults(func=cmd_clean_temp)
 
     # ui
     p_ui = sub.add_parser("ui", help="Execute low-level touch or key action (defaults to fast uinput engine)")
@@ -1090,16 +1279,112 @@ def build_parser() -> argparse.ArgumentParser:
     p_deliv.add_argument("--output", help="Optional output JSON file path")
     p_deliv.set_defaults(func=cmd_deliver_file)
 
+    # --output is optional everywhere: default to ~/.gemini/hdc_last_output.json
+    # (image modes substitute their own default names at runtime).
+    for action in p._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for sub_parser in action.choices.values():
+                for sub_action in sub_parser._actions:
+                    if getattr(sub_action, "dest", None) == "output":
+                        sub_action.required = False
     return p
+
+
+def send_telemetry(
+    host: str | None,
+    port: int | None,
+    started_at: float,
+    elapsed_ms: float,
+    ok: bool,
+    error: str,
+):
+    """Report this CLI invocation to the daemon console (local IPC only; never spawns one)."""
+    saved = load_saved_target()
+    target_host = host or saved.get("host")
+    target_port = port or saved.get("port")
+    if not target_host or not target_port:
+        return
+    for _ in range(3):
+        client = try_connect_daemon(target_host, int(target_port), timeout=0.1)
+        if client is None:
+            time.sleep(0.05)
+            continue
+        try:
+            client._call(
+                {
+                    "op": "log",
+                    "argv": " ".join(sys.argv[1:]),
+                    "started_at": started_at,
+                    "elapsed_ms": elapsed_ms,
+                    "ok": ok,
+                    "error": error,
+                    "client": config.CLIENT_META,
+                },
+                timeout=1.0,
+            )
+        except Exception:
+            pass
+        finally:
+            client.close()
+        return
 
 
 def main():
     parser = build_parser()
     args = parser.parse_args()
+    started_at = time.time()
+    t0 = time.perf_counter()
+    config.CURRENT_SUBCOMMAND = args.subcommand
+    config.CLIENT_META.clear()
+    config.CLIENT_META.update(
+        {
+            "id": f"{os.getpid()}-{int(started_at * 1000) % 1000000}",
+            "pid": os.getpid(),
+            "argv": " ".join(sys.argv[1:])[:300],
+            "subcommand": args.subcommand,
+        }
+    )
+    ok = True
+    error_text = ""
     try:
         args.func(args)
     except Exception as exc:
+        ok = False
+        error_text = str(exc)
         print(f"Error: {exc}", file=sys.stderr)
+    finally:
+        if args.subcommand != "daemon":
+            send_telemetry(
+                getattr(args, "host", None),
+                getattr(args, "port", None),
+                started_at,
+                (time.perf_counter() - t0) * 1000.0,
+                ok,
+                error_text,
+            )
+        if (
+            not ok
+            and args.subcommand != "daemon"
+            and not getattr(args, "output", None)
+        ):
+            try:
+                error_path = resolve_output_path(None)
+                error_path.parent.mkdir(parents=True, exist_ok=True)
+                error_path.write_text(
+                    json.dumps(
+                        {
+                            "status": "error",
+                            "subcommand": args.subcommand,
+                            "error": error_text,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+    if not ok:
         sys.exit(1)
 
 
