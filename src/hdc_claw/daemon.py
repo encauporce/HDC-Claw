@@ -230,13 +230,20 @@ class LocalHdcDaemonServer:
         return f"\033[{code}m{text}\033[0m"
 
     def emit_header(self):
-        self.log(f"{'TIME':<12}  {'ID':<4} {'DUR':>7}  {'GAP':>8}  CMD")
+        head_time = self._color(f"{'TIME':<12}", "96")
+        head_id = self._color(f"{'ID':<4}", "92")
+        head_dur = self._color(f"{'DUR':>7}", "93")
+        head_gap = self._color(f"{'GAP':>8}", "36")
+        head_cmd = self._color("CMD", "90")
+        self.log(f"{head_time}  {head_id} {head_dur}  {head_gap}  {head_cmd}")
         with self.stats_lock:
             self.lines_since_header = 0
 
     def emit_event(self, label: str, detail: str = ""):
         text = f"{label} {detail}".strip()
-        self.log(f"{self._ts():<12}  {'--':<4} {'':>7}  {'':>8}  {text}")
+        ts_col = self._color(f"{self._ts():<12}", "96")
+        id_col = self._color(f"{'--':<4}", "92")
+        self.log(f"{ts_col}  {id_col} {'':>7}  {'':>8}  {text}")
 
     def emit_command(
         self,
@@ -265,20 +272,25 @@ class LocalHdcDaemonServer:
             cmd = " ".join((argv or "").split())
             if len(cmd) > 110:
                 cmd = cmd[:107] + "..."
-            id_str = f"#{idx:03d}"
-            dur_str = f"{_fmt_ms(elapsed_ms):>7}"
-            gap_str = "—" if gap is None else _fmt_ms(gap)
-            if elapsed_ms >= self.slow_ms:
-                dur_str = self._color(dur_str, "33")
+            id_text = f"#{idx:03d}"
+            dur_text = f"{_fmt_ms(elapsed_ms):>7}"
+            gap_text = "—" if gap is None else _fmt_ms(gap)
+            ts_col = self._color(f"{self._ts():<12}", "96")
+            id_col = self._color(f"{id_text:<4}", "92")
+            dur_col = self._color(
+                dur_text, "91" if elapsed_ms >= self.slow_ms else "93"
+            )
+            gap_col = self._color(f"{gap_text:>8}", "36")
+            cmd_col = self._color(cmd, "90")
             mark = ""
             if not ok:
-                mark = "  " + self._color("ERR", "31")
+                mark = "  " + self._color("ERR", "91")
             elif elapsed_ms >= self.slow_ms:
-                mark = "  " + self._color("SLOW", "33")
-            self.log(f"{self._ts():<12}  {id_str:<4} {dur_str}  {gap_str:>8}  {cmd}{mark}")
+                mark = "  " + self._color("SLOW", "93")
+            self.log(f"{ts_col}  {id_col} {dur_col}  {gap_col}  {cmd_col}{mark}")
             indent = " " * 38
             if not ok and error:
-                self.log(indent + self._color(f"└ {error[:160]}", "31"))
+                self.log(indent + self._color(f"└ {error[:160]}", "91"))
             if ops and (self.verbose or len(ops) > 1):
                 if self.verbose:
                     for i, op in enumerate(ops[:10]):
