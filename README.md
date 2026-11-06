@@ -4,8 +4,11 @@
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-green.svg)](https://www.python.org/downloads/)
 [![HarmonyOS](https://img.shields.io/badge/HarmonyOS-NEXT%20%2F%206.0-red.svg)](https://developer.huawei.com/consumer/cn/harmonyos/)
 [![OpenHarmony](https://img.shields.io/badge/Protocol-OpenHarmony%20HDC-orange.svg)](https://gitee.com/openharmony)
+[![Release: v3.3.0](https://img.shields.io/badge/Release-v3.3.0-brightgreen)](https://github.com/encauporce/HDC-Claw/releases/tag/v3.3.0)
 
 **Pure-Python HarmonyOS NEXT / 6.0 HDC Wireless Protocol Client & AI Agent Automation Toolkit.**
+
+📦 **Download / changelog: [Releases](https://github.com/encauporce/HDC-Claw/releases)** — latest is [`v3.3.0`](https://github.com/encauporce/HDC-Claw/releases/tag/v3.3.0), matching `hdc-claw --version`.
 
 Zero external binaries. Zero DevEco Studio / SDK requirements. Native RSA-3072 handshake, persistent keep-alive daemon (<15ms latency), kernel-level `/bin/uinput` touch/key fast-path, closed-loop UI diff feedback, and Taobao-resilient zero-inertia visual long-screenshots.
 
@@ -63,7 +66,29 @@ cd HDC-Claw
 pip install -e .
 ```
 
-Requires **Python 3.9+**, `cryptography`, and `Pillow`.
+Or install a pinned release archive instead of the moving `main` branch:
+
+```bash
+pip install https://github.com/encauporce/HDC-Claw/archive/refs/tags/v3.3.0.tar.gz
+```
+
+Requires **Python 3.9+**, `cryptography`, and `Pillow`. Verify with:
+
+```bash
+hdc-claw --version   # -> hdc-claw 3.3.0
+```
+
+---
+
+### 🔌 Device prerequisites
+
+Nothing needs to be installed on the tablet, but wireless HDC must be enabled before the first connection:
+
+1. On the device, turn on **Developer options → Wireless debugging**, and note the `IP:port` it shows. HDC listens on a *random high port that changes* every time the toggle (or the device) is restarted.
+2. Put the PC and the device on the **same L2 segment** (same LAN / same hotspot). Cross-NAT or VLAN-isolated networks will time out at the TCP handshake.
+3. Run `hdc-claw --host <ip> --port <port> connect`. The first handshake makes the device pop up an **HDC debugging authorization dialog** (RSA-3072 fingerprint) — accept it, otherwise the session is refused.
+4. Lost the port? `hdc-claw --host <ip> --scan connect` scans `30000-49999`. If the device reports a port outside that range, pass it explicitly with `--port`.
+5. Reboot the tablet, or toggle wireless debugging, and re-run step 3 — the cached daemon session is no longer valid.
 
 ---
 
@@ -108,6 +133,56 @@ hdc-claw config --output-dir D:\hdc_runs
 # Sweep leftover device temp files
 hdc-claw clean-temp
 ```
+
+---
+
+### 📦 Subcommand reference
+
+All 17 subcommands, straight from `argparse` in `src/hdc_claw/cli.py`:
+
+| Subcommand | What it does |
+| :--- | :--- |
+| `connect` | Handshake, warm up the daemon, and cache the session |
+| `daemon` | Manage the keep-alive multiplexer on `127.0.0.1:18710` (`--action start\|stop\|status\|serve`) |
+| `shell` | Run one device shell command through `CMD_UNITY_EXECUTE (1001)` |
+| `dump-ui` | Dump the layout tree (semantic-compact by default) |
+| `tap` | Locate by `--text` / `--key` (warm cache) or `--x` / `--y`, tap, return feedback |
+| `input-text` | One-shot UTF-8 (Chinese) injection: `--target-text` focus, `--submit`, `--hide-keyboard` |
+| `batch` | Several semantic/coordinate steps in one session (`tap-text`, `wait-text`, …) |
+| `launch` | Start an app by Chinese/English display name or bundle name (`--list-apps` to enumerate) |
+| `push` | Local → device transfer with SHA256 verification |
+| `pull` | Device → local binary-clean stream |
+| `install` | Push and install a local `.hap` |
+| `screen` | Power modes `keep-awake` / `performance` / `normal`, plus `snapshot` and `long-snapshot` |
+| `long-screen` | Zero-inertia dead-stop scroll capture → native viewport slices + manifest |
+| `ui` | Low-level primitive: `click` / `double-click` / `long-click` / `swipe` / `key` / `text` |
+| `clean-temp` | Delete leftover temp images and UI dumps on the device |
+| `config` | Show or set persistent defaults (`--output-dir`) |
+| `deliver-file` | Drop a file into the public Download folder and open it with a target app |
+
+Flags that are shared across the action subcommands:
+
+| Flag | Values / default |
+| :--- | :--- |
+| `--host` / `--port` | Falls back to the last connected host; port is the wireless-debugging port |
+| `--scan` | Force a `30000-49999` port sweep when the connection times out |
+| `--no-daemon` | Skip `127.0.0.1:18710` and open a fresh TCP + RSA session |
+| `-F`, `--feedback` | `none` (default) `diff` `summary` `full` `screen` `both` `auto` `crop` |
+| `-W`, `--wait-after` | On-device settle wait before capture (default `0.35` s) |
+| `--wait-change` | Re-check once after an extra 0.45 s if the UI has not changed |
+| `--annotate` | Draw element boxes / IDs on `screen` / `both` / `auto` images |
+| `--keep-device-temp` | Keep `/data/local/tmp` artifacts instead of deleting them after capture |
+
+---
+
+### ⚠️ Known limitations
+
+- **Wireless HDC only.** There is no USB transport in this codebase; the device must be reachable over the network.
+- **The HDC port is ephemeral.** It changes whenever wireless debugging is toggled or the device reboots, and the daemon's cached session goes stale at the same time — re-run `connect`.
+- **`--scan` only covers `30000-49999`.** If the panel shows a port outside that band, pass `--port` yourself.
+- **Default output paths are `~/.gemini/`** (`hdc_last_output.json`, `hdc_last_screen.jpg`, `hdc_last_long.json`), plus `~/.gemini/hdc_config.json` and `~/.gemini/hdc_daemon.log`. That directory name is a leftover from the agent runtime this tool was written in, not a dependency on any other product — change it once with `hdc-claw config --output-dir <dir>`.
+- **The performance table is single-device self-measurement**, not a cross-device benchmark; your numbers will differ with Wi-Fi quality, model, and OS build.
+- **`-F crop` needs a matched element**, so it applies to `tap` / `input-text` only.
 
 ---
 
@@ -173,6 +248,36 @@ sess.close()
 - **daemon 实时控制台**：`TIME | ID | DUR | GAP | CMD` 计时表，`SLOW`/`ERR` 标记，`--verbose` 显示每步操作细节，日志镜像到 `~/.gemini/hdc_daemon.log`。
 - **输出零配置**：所有 `--output` 可选，默认 `~/.gemini/hdc_last_output.json` / `hdc_last_screen.jpg` / `hdc_last_long.json`；`config --output-dir` 一次改默认目录。
 - **电源模式修正**：`keep-awake` = `power-shell wakeup` + `timeout -o`，不再误开 602 性能模式；`performance` 改为显式开启，`normal` 恢复 600 + 默认超时。
+
+---
+
+### 📦 安装与发布版
+
+```bash
+pip install -e .                                            # 跟踪 main
+pip install https://github.com/encauporce/HDC-Claw/archive/refs/tags/v3.3.0.tar.gz   # 锁定发布版
+```
+
+发布记录与打包下载见 [Releases](https://github.com/encauporce/HDC-Claw/releases)，最新为 [`v3.3.0`](https://github.com/encauporce/HDC-Claw/releases/tag/v3.3.0)。开箱即用的 Agent Skill 规范在 [`skills/harmonyos-hdc/SKILL.md`](skills/harmonyos-hdc/SKILL.md)，`examples/` 下有两条可直接跑的最小脚本。
+
+### 📖 子命令总表
+
+17 个子命令（`connect` `daemon` `shell` `dump-ui` `tap` `input-text` `batch` `launch` `push` `pull` `install` `screen` `long-screen` `ui` `clean-temp` `config` `deliver-file`）与共享参数（`-F` `-W` `--scan` `--no-daemon` `--annotate` `--wait-change` `--keep-device-temp`）的逐项说明，见上文 [Subcommand reference](#-subcommand-reference)。
+
+### 🔌 设备端准备
+
+1. 设备打开「开发者选项 → 无线调试」，记下显示的 `IP:端口`。这个端口在每次重新开关无线调试或重启后都会变化。
+2. 电脑与设备必须在**同一局域网/同一热点**，跨网段会在 TCP 握手阶段直接超时。
+3. 首次 `connect` 时设备端会弹出 **HDC 调试授权**（RSA-3072 指纹）对话框，必须点允许，否则鉴权被拒。
+4. 忘记端口就加 `--scan`（扫描 `30000-49999`）；不在该区间就手动 `--port`。
+
+### ⚠️ 已知限制
+
+- **只支持无线 HDC**，代码里没有 USB 通道，设备必须网络可达。
+- 端口变化或设备重启后，守护进程缓存的 session 即失效，需要重新 `connect`。
+- 默认产物写在 `~/.gemini/`（`hdc_last_output.json` / `hdc_last_screen.jpg` / `hdc_last_long.json`），配置在 `~/.gemini/hdc_config.json`，daemon 日志在 `~/.gemini/hdc_daemon.log`。这个目录名是本项目早期运行环境的遗留，不代表依赖任何其它产品，可用 `config --output-dir` 一次性改掉。
+- 性能对比表是作者单台设备的自测数据，不是跨机型基准；受 Wi-Fi 质量、机型和系统版本影响很大。
+- `-F crop` 依赖命中的元素，只对 `tap` / `input-text` 有效。
 
 ---
 
